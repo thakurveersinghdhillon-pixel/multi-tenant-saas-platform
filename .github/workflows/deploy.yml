@@ -1,0 +1,253 @@
+name: CD & Azure Deployment Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azure-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  quality-gate:
+    name: Verify Quality Gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: saas_platform_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      PORT: 3001
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/saas_platform_test?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      JWT_SECRET: super_secret_jwt_access_key_minimum_32_characters_long
+      JWT_REFRESH_SECRET: super_secret_jwt_refresh_key_minimum_32_characters_long
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Backend Dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Generate Prisma Client & Migrate Test DB
+        working-directory: ./backend
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+
+      - name: Run ESLint
+        working-directory: ./backend
+        run: npm run lint
+
+      - name: Run Unit Tests (146 tests)
+        working-directory: ./backend
+        run: npm run test
+
+      - name: Run E2E Tests (168 tests)
+        working-directory: ./backend
+        run: npm run test:e2e
+
+      - name: Build Backend
+        working-directory: ./backend
+        run: npm run build
+
+  build-and-push-images:
+    name: Build & Push Production Images to ACR
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    outputs:
+      backend_tag: ${{ steps.prep.outputs.backend_tag }}
+      frontend_tag: ${{ steps.prep.outputs.frontend_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Image Tags
+        id: prep
+        run: |
+          ACR_SERVER="${{ secrets.ACR_LOGIN_SERVER || 'saasprodacr.azurecr.io' }}"
+          SHA_TAG="${{ github.sha }}"
+          echo "backend_tag=${ACR_SERVER}/multi-tenant-saas-backend:${SHA_TAG}" >> $GITHUB_OUTPUT
+          echo "frontend_tag=${ACR_SERVER}/multi-tenant-saas-frontend:${SHA_TAG}" >> $GITHUB_OUTPUT
+          echo "acr_server=${ACR_SERVER}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ steps.prep.outputs.acr_server }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build & Push Backend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.prep.outputs.acr_server }}/multi-tenant-saas-backend:latest
+            ${{ steps.prep.outputs.acr_server }}/multi-tenant-saas-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.prep.outputs.acr_server }}/multi-tenant-saas-frontend:latest
+            ${{ steps.prep.outputs.acr_server }}/multi-tenant-saas-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  run-database-migrations:
+    name: Deploy Database Migrations to Azure PostgreSQL
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Backend Dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Execute Prisma Migrate Deploy
+        working-directory: ./backend
+        env:
+          DATABASE_URL: ${{ secrets.AZURE_POSTGRESQL_DATABASE_URL }}
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+
+  deploy-to-azure:
+    name: Deploy to Azure Container Apps
+    needs: [build-and-push-images, run-database-migrations]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Backend Container App
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: ${{ github.workspace }}/backend
+          acrName: ${{ secrets.ACR_NAME || 'saasprodacr' }}
+          containerAppName: ${{ secrets.AZURE_BACKEND_APP_NAME || 'saas-prod-backend' }}
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP || 'rg-multi-tenant-saas-prod' }}
+          imageToDeploy: ${{ needs.build-and-push-images.outputs.backend_tag }}
+          environmentVariables: >-
+            NODE_ENV=production
+            PORT=3001
+            CORS_ORIGIN=${{ secrets.AZURE_FRONTEND_URL }}
+            FRONTEND_URL=${{ secrets.AZURE_FRONTEND_URL }}
+            DATABASE_URL=secretref:database-url
+            REDIS_URL=secretref:redis-url
+            JWT_SECRET=secretref:jwt-secret
+            JWT_REFRESH_SECRET=secretref:jwt-refresh-secret
+
+      - name: Deploy Frontend Container App
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: ${{ github.workspace }}/frontend
+          acrName: ${{ secrets.ACR_NAME || 'saasprodacr' }}
+          containerAppName: ${{ secrets.AZURE_FRONTEND_APP_NAME || 'saas-prod-frontend' }}
+          resourceGroup: ${{ secrets.AZURE_RESOURCE_GROUP || 'rg-multi-tenant-saas-prod' }}
+          imageToDeploy: ${{ needs.build-and-push-images.outputs.frontend_tag }}
+          environmentVariables: >-
+            NODE_ENV=production
+            NEXT_PUBLIC_API_URL=${{ secrets.AZURE_BACKEND_URL }}
+
+  post-deployment-smoke-test:
+    name: Automated Post-Deployment Smoke Test
+    needs: deploy-to-azure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Backend Health Endpoint
+        run: |
+          BACKEND_URL="${{ secrets.AZURE_BACKEND_URL || 'https://saas-prod-backend.azurecontainerapps.io' }}"
+          echo "Pinging Backend Health Endpoint: ${BACKEND_URL}/health"
+          RESPONSE=$(curl -s -f --max-time 30 "${BACKEND_URL}/health")
+          echo "Response: ${RESPONSE}"
+          if [[ "${RESPONSE}" != *"\"status\":\"ok\""* ]]; then
+            echo "Backend Health Check Failed!"
+            exit 1
+          fi
+          echo "Backend Health Check PASSED!"
+
+      - name: Verify Frontend Reachability
+        run: |
+          FRONTEND_URL="${{ secrets.AZURE_FRONTEND_URL || 'https://saas-prod-frontend.azurecontainerapps.io' }}"
+          echo "Pinging Frontend Endpoint: ${FRONTEND_URL}/"
+          STATUS_CODE=$(curl -o /dev/null -s -w "%{http_code}" --max-time 30 "${FRONTEND_URL}/")
+          echo "HTTP Status Code: ${STATUS_CODE}"
+          if [ "${STATUS_CODE}" -ne 200 ]; then
+            echo "Frontend Reachability Check Failed!"
+            exit 1
+          fi
+          echo "Frontend Reachability PASSED!"
+
+      - name: Run Live REST & WebSocket Smoke Test
+        working-directory: ./backend
+        env:
+          BASE_URL: ${{ secrets.AZURE_BACKEND_URL || 'https://saas-prod-backend.azurecontainerapps.io' }}
+        run: |
+          npm ci
+          node ../scratch/test-prod-rest.js

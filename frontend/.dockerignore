@@ -1,0 +1,14 @@
+node_modules
+.git
+.env
+.env*.local
+.env.production
+coverage
+.next
+logs
+*.log
+npm-debug.log*
+.vscode
+.idea
+README.md
+scratch
