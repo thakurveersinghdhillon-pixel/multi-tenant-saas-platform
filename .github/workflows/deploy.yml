@@ -70,6 +70,7 @@ jobs:
         run: |
           npx prisma generate
           npx prisma migrate deploy
+          npx prisma db seed
 
       - name: Run ESLint
         working-directory: ./backend

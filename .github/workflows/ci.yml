@@ -76,9 +76,11 @@ jobs:
         working-directory: ./backend
         run: npm run lint
 
-      - name: Run Prisma Database Migrations
+      - name: Run Prisma Database Migrations & Seed RBAC
         working-directory: ./backend
-        run: npx prisma migrate deploy
+        run: |
+          npx prisma migrate deploy
+          npx prisma db seed
 
       - name: Run Unit Tests (19 suites, 146 tests)
         working-directory: ./backend
