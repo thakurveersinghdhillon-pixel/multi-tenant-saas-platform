@@ -13,8 +13,8 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   private client: Redis | null = null;
   private isHealthy = false;
 
-  onModuleInit() {
-    this.initRedisClient();
+  async onModuleInit() {
+    await this.initRedisClient();
   }
 
   onModuleDestroy() {
@@ -26,7 +26,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   /**
    * Initialize ioredis client with connection event listeners & retry strategy
    */
-  private initRedisClient() {
+  private async initRedisClient() {
     try {
       const redisUrl = process.env.REDIS_URL;
       const host = process.env.REDIS_HOST || "localhost";
@@ -62,13 +62,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
         );
       });
 
-      // Attempt initial connection asynchronously
-      this.client.connect().catch((err) => {
+      // Attempt initial connection
+      try {
+        await this.client.connect();
+      } catch (err: any) {
         this.isHealthy = false;
         this.logger.warn(
           `${CACHE_LOG_PREFIX.ERROR} Redis initial connection failed: ${err.message}`,
         );
-      });
+      }
     } catch (err: any) {
       this.isHealthy = false;
       this.logger.warn(
@@ -261,6 +263,46 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
         `${CACHE_LOG_PREFIX.ERROR} Failed invalidateByPrefix for ${prefix}: ${err.message}`,
       );
       return 0;
+    }
+  }
+
+  /**
+   * Atomically increment a counter key and set TTL on first creation
+   */
+  async incr(key: string, ttlSeconds?: number): Promise<number | null> {
+    if (!this.client || !this.isHealthy) {
+      return null;
+    }
+
+    try {
+      const current = await this.client.incr(key);
+      if (current === 1 && ttlSeconds && ttlSeconds > 0) {
+        await this.client.expire(key, ttlSeconds);
+      }
+      return current;
+    } catch (err: any) {
+      this.logger.warn(
+        `${CACHE_LOG_PREFIX.ERROR} Failed incr for key ${key}: ${err.message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Get remaining TTL in seconds for a key
+   */
+  async ttl(key: string): Promise<number | null> {
+    if (!this.client || !this.isHealthy) {
+      return null;
+    }
+
+    try {
+      return await this.client.ttl(key);
+    } catch (err: any) {
+      this.logger.warn(
+        `${CACHE_LOG_PREFIX.ERROR} Failed ttl for key ${key}: ${err.message}`,
+      );
+      return null;
     }
   }
 }

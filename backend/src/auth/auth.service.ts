@@ -19,17 +19,22 @@ import * as crypto from "crypto";
 
 @Injectable()
 export class AuthService {
+  // Precomputed dummy bcrypt hash (cost factor 10) to prevent user enumeration timing attacks
+  private static readonly DUMMY_HASH =
+    "$2a$10$wK1vE8mN5oY1zK0vF7tA.OGlR8kL6aY.y9wR/C3sB4mD2jH6eK4mG";
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
   ) {}
 
   /**
-   * Register a new user
+   * Register a new user with normalized email
    */
   async register(dto: RegisterDto): Promise<AuthResponse> {
+    const normalizedEmail = dto.email.toLowerCase().trim();
     const existingUser = await this.prisma.user.findUnique({
-      where: { email: dto.email.toLowerCase() },
+      where: { email: normalizedEmail },
     });
 
     if (existingUser) {
@@ -40,10 +45,10 @@ export class AuthService {
 
     const user = await this.prisma.user.create({
       data: {
-        email: dto.email.toLowerCase(),
+        email: normalizedEmail,
         passwordHash,
-        firstName: dto.firstName,
-        lastName: dto.lastName,
+        firstName: dto.firstName.trim(),
+        lastName: dto.lastName.trim(),
       },
     });
 
@@ -56,14 +61,17 @@ export class AuthService {
   }
 
   /**
-   * Login user with credentials
+   * Login user with credentials, protected against user enumeration timing attacks
    */
   async login(dto: LoginDto): Promise<AuthResponse> {
+    const normalizedEmail = dto.email.toLowerCase().trim();
     const user = await this.prisma.user.findUnique({
-      where: { email: dto.email.toLowerCase() },
+      where: { email: normalizedEmail },
     });
 
     if (!user || !user.isActive) {
+      // Execute dummy bcrypt compare to equalize timing with valid user lookup
+      await bcrypt.compare(dto.password, AuthService.DUMMY_HASH);
       throw new UnauthorizedException("Invalid email or password");
     }
 
@@ -84,21 +92,41 @@ export class AuthService {
   }
 
   /**
-   * Refresh access token and rotate refresh token
+   * Refresh access token and rotate refresh token with RFC 6819 token family reuse detection
    */
   async refreshToken(
     dto: RefreshTokenDto,
   ): Promise<{ accessToken: string; refreshToken: string }> {
-    const tokenHash = this.hashToken(dto.refreshToken);
+    const tokenHash = this.hashToken(dto.refreshToken.trim());
 
     const storedToken = await this.prisma.refreshToken.findFirst({
       where: { tokenHash },
       include: { user: true },
     });
 
+    if (!storedToken) {
+      throw new UnauthorizedException("Invalid or expired refresh token");
+    }
+
+    // Refresh Token Family Reuse Detection (RFC 6819):
+    // If a revoked token is reused outside the rotation leeway/grace window (3 seconds),
+    // it indicates a replay/theft attack. Invalidate all active tokens in the family.
+    if (storedToken.revokedAt) {
+      const gracePeriodMs = 3000;
+      const isOutsideGrace =
+        Date.now() - storedToken.revokedAt.getTime() > gracePeriodMs;
+
+      if (isOutsideGrace) {
+        await this.prisma.refreshToken.updateMany({
+          where: { userId: storedToken.userId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
+
+      throw new UnauthorizedException("Invalid or expired refresh token");
+    }
+
     if (
-      !storedToken ||
-      storedToken.revokedAt ||
       storedToken.expiresAt < new Date() ||
       !storedToken.user ||
       !storedToken.user.isActive
@@ -120,7 +148,7 @@ export class AuthService {
    * Logout user by revoking refresh token
    */
   async logout(dto: LogoutDto): Promise<{ message: string }> {
-    const tokenHash = this.hashToken(dto.refreshToken);
+    const tokenHash = this.hashToken(dto.refreshToken.trim());
 
     await this.prisma.refreshToken.updateMany({
       where: { tokenHash, revokedAt: null },

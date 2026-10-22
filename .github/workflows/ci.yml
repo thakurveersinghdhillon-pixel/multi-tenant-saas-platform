@@ -82,11 +82,11 @@ jobs:
           npx prisma migrate deploy
           npx prisma db seed
 
-      - name: Run Unit Tests (19 suites, 146 tests)
+      - name: Run Unit Tests (20 suites, 152 tests)
         working-directory: ./backend
         run: npm run test
 
-      - name: Run E2E Tests (12 suites, 168 tests)
+      - name: Run E2E Tests (13 suites, 178 tests)
         working-directory: ./backend
         run: npm run test:e2e
 

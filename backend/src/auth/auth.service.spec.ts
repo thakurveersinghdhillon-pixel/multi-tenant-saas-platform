@@ -101,4 +101,67 @@ describe("AuthService (Unit)", () => {
       ).rejects.toThrow(UnauthorizedException);
     });
   });
+
+  describe("refreshToken (Token Family Reuse Detection)", () => {
+    it("should throw UnauthorizedException and revoke entire token family when a revoked token is reused", async () => {
+      const revokedToken = {
+        id: "token-1",
+        userId: "user-uuid-1",
+        tokenHash: "revoked-token-hash",
+        revokedAt: new Date(Date.now() - 3600000), // revoked 1 hour ago
+        expiresAt: new Date(Date.now() + 86400000),
+        user: mockUser,
+      };
+
+      mockPrismaService.refreshToken.findFirst.mockResolvedValueOnce(
+        revokedToken,
+      );
+      mockPrismaService.refreshToken.updateMany.mockResolvedValueOnce({
+        count: 2,
+      });
+
+      await expect(
+        service.refreshToken({
+          refreshToken: "compromised_replayed_token",
+        }),
+      ).rejects.toThrow(UnauthorizedException);
+
+      // Verify all active tokens for this user were revoked
+      expect(mockPrismaService.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: "user-uuid-1", revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+
+    it("should successfully rotate refresh token and revoke previous token", async () => {
+      const validToken = {
+        id: "token-2",
+        userId: "user-uuid-1",
+        tokenHash: "valid-token-hash",
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 86400000),
+        user: mockUser,
+      };
+
+      mockPrismaService.refreshToken.findFirst.mockResolvedValueOnce(
+        validToken,
+      );
+      mockPrismaService.refreshToken.update.mockResolvedValueOnce({
+        ...validToken,
+        revokedAt: new Date(),
+      });
+      mockPrismaService.refreshToken.create.mockResolvedValueOnce({});
+
+      const result = await service.refreshToken({
+        refreshToken: "valid_active_token",
+      });
+
+      expect(result.accessToken).toBe("mocked_access_token");
+      expect(result.refreshToken).toBeDefined();
+      expect(mockPrismaService.refreshToken.update).toHaveBeenCalledWith({
+        where: { id: "token-2" },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+  });
 });
